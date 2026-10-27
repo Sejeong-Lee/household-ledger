@@ -1,0 +1,553 @@
+<script>
+/* ===== Household Ledger v2 — screen logic =====
+   Engine.html (loaded first) is the old app's pure functions, cut as-is.
+   Globals the engine expects are defined here: ST, $, money, pad, titleCase, acctOf,
+   checkSource, renderFiles, renderReview, setAsk. Four engine functions are replaced
+   below (predict wrapper, extractPrompt, readPdf, readImage) so Claude calls go through
+   google.script.run.callClaude and PDF/screenshot totals get verified. */
+
+const $=id=>document.getElementById(id);
+const money=(n,d=2)=>Number(n).toLocaleString("en-SG",{minimumFractionDigits:d,maximumFractionDigits:d});
+const pad=n=>String(n).padStart(2,"0");
+const titleCase=s=>String(s||"").toLowerCase().replace(/\b[a-z]/g,c=>c.toUpperCase());
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const gs=(fn,...a)=>new Promise((ok,no)=>google.script.run.withSuccessHandler(ok).withFailureHandler(no)[fn](...a));
+if(window.pdfjsLib)pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+function prevMonth(){const d=new Date();d.setDate(1);d.setMonth(d.getMonth()-1);return d.getFullYear()+"-"+pad(d.getMonth()+1)}
+function shiftMonth(m,n){const [y,mo]=m.split("-").map(Number);const d=new Date(y,mo-1+n,1);return d.getFullYear()+"-"+pad(d.getMonth()+1)}
+function monthLabel(m){const [y,mo]=m.split("-").map(Number);return new Date(y,mo-1,1).toLocaleDateString("en-GB",{month:"long",year:"numeric"})}
+
+const ST={cfg:{fx:{},ratio:{Ankit:0.6,Sejeong:0.4},income:{}},S:{},accts:[],hist:[],idx:buildIndex([]),pend:[],files:[],uid:0,fid:0,
+  month:prevMonth(),me:{name:"",email:""},rules:[],sheetRules:[],fxLive:{},usage:null,sample:null,mode:"sheet",
+  view:"upload",flt:"mine",showConf:false,mView:"cat",mSel:null,mMonth:"",mAll:false,busy:false,ask:"",loaded:false};
+const S=(k,d)=>{const v=ST.S[k];return v===undefined||v===""||v===null?d:v};
+const acctOf=name=>ST.accts.find(a=>a.name===name)||{name,owner:"Joint",currency:"SGD",sign:""};
+const uploadable=a=>!/^(manual|none|no|off|skip|n\/a)$/i.test(String(a.collection||"").trim());
+const myAccts=()=>ST.accts.filter(a=>a.owner===ST.me.name&&uploadable(a));
+const jointAccts=()=>ST.accts.filter(a=>a.owner==="Joint"&&uploadable(a));
+const otherName=()=>PEOPLE.find(p=>p!==ST.me.name)||"";
+const nameOf=email=>{const v=ST.S["user_"+String(email).toLowerCase()];return v||email};
+const shareName=s=>!s?"whose: from history":s==="Owner"?"Owner's personal":s;
+
+/* ---------- small helpers ---------- */
+function toObjs(rows){const h=(rows[0]||[]).map(x=>String(x).trim());return rows.slice(1).filter(r=>r.some(c=>c!==""&&c!=null)).map(r=>{const o={};h.forEach((k,i)=>o[k]=r[i]);return o})}
+function errMsg(e){let m=(e&&(e.msg||e.message))||String(e||"Something went wrong.");m=String(m).replace(/^Exception:\s*/,"").replace(/^Error:\s*/,"");
+  if(/permission|access denied|do not have access|requested entity was not found/i.test(m)&&!/Claude API/i.test(m))return "No access to the ledger sheet. Ask Sejeong to share it with this Google account.";return m}
+function banner(msg){const b=$("banner");if(!msg){b.hidden=true;b.innerHTML="";return}b.hidden=false;b.innerHTML=`<div style="flex:1">${esc(msg)}</div><button class="link" data-c="closeBanner" style="padding:0">✕</button>`}
+function parseJson(t){t=String(t||"").trim().replace(/^```(?:json)?\s*/i,"").replace(/```\s*$/,"");try{return JSON.parse(t)}catch(e){}
+  const a=t.search(/[\[{]/),b=Math.max(t.lastIndexOf("]"),t.lastIndexOf("}"));if(a>=0&&b>a){try{return JSON.parse(t.slice(a,b+1))}catch(e){}}
+  throw {msg:"Claude's reply couldn't be read. Please try again."}}
+const modelLabel=m=>/sonnet/i.test(m)?"Sonnet":/opus/i.test(m)?"Opus":"Haiku";
+/* rules tab: key, cat, sub, share, memo, set_by, set_at, conf, note. key "re:..." = regex on the raw description (case-insensitive), otherwise exact normKey().key */
+function compileRules(){
+  ST.sheetRules=[];
+  for(const r of ST.rules){
+    const key=String(r.key||"").trim();if(!key||!TAX[r.cat]||!TAX[r.cat].includes(r.sub))continue;
+    const o={cat:r.cat,sub:r.sub,share:String(r.share||"").trim(),memo:String(r.memo||""),conf:String(r.conf||"mid").trim().toLowerCase()==="high"?"high":"mid",set_by:String(r.set_by||""),note:String(r.note||"")};
+    if(/^re:/i.test(key)){try{o.re=new RegExp(key.slice(3),"i")}catch(e){continue}}else o.key=key;
+    ST.sheetRules.push(o);
+  }
+}
+const reindex=()=>{ST.idx=buildIndex(ST.hist);compileRules()};
+const whoOf=h=>h.share==="Shared"?"Shared":h.share==="Personal - Ankit"?"Ankit":"Sejeong";
+const WHO={Shared:"#2d6a52",Ankit:"#3f6fb0",Sejeong:"#c46a1c"};
+const WC={Shared:"#5fb98f",Ankit:"#7ea6dc",Sejeong:"#e39a5a"};
+
+/* ---------- engine hooks ---------- */
+ST.sample={
+  async json(prompt,o={}){const model=o.model||S("model_classify","claude-haiku-5-5");
+    const r=await gs("callClaude",model,o.system||"Reply with JSON only. No prose, no markdown fences.",o.content||prompt,o.maxTokens||8000);
+    return parseJson(r.text)},
+  async limits(){return {images:true}}
+};
+/* classification order: engine RULES (high) → rules tab (high) → history, same key → rules tab (mid) → similar key → fee follows parent → AI */
+function matchRule(row,n,conf){return ST.sheetRules.find(r=>r.conf===conf&&(r.re?r.re.test(row.desc):(n.key&&r.key===n.key)))||null}
+function ruleResult(r,row,idx,n){
+  let share=r.share;
+  if(share==="Owner")share=row.owner==="Joint"?"Shared":"Personal - "+row.owner;
+  else if(!share){const ex=idx.key.get(n.key);share=ex&&ex.length?vote(ex,row.owner).share:""}
+  const unresolved=!share,who=r.set_by==="seed"?"Preset rule":"Saved rule"+(r.set_by?" by "+nameOf(r.set_by):"");
+  return {cat:r.cat,sub:r.sub,share:share||"Shared",memo:r.memo,conf:unresolved&&r.conf==="high"?"mid":r.conf,src:"rule",why:who+(unresolved?". Please pick whose it is.":".")};
+}
+predict=function(row,idx){
+  const n=normKey(row.desc);
+  for(const r of RULES)if(r.conf==="high"&&r.re.test(row.desc))return {...r.p,memo:"",conf:"high",src:"rule",why:r.why};
+  const hi=matchRule(row,n,"high");if(hi)return ruleResult(hi,row,idx,n);
+  if(n.incoming&&row.amt!=null&&row.amt<0)return {cat:"EAT",sub:"Dine out",share:"Shared",memo:"",conf:"mid",src:"rule",why:"Money in from someone. Treated as their share of a meal, which lowers your spend."};
+  const ex=idx.key.get(n.key);
+  if(ex&&ex.length){
+    const v=vote(ex,row.owner),high=v.n>=2&&v.agreeL>=0.75&&v.agreeS>=0.75;
+    return {cat:v.cat,sub:v.sub,share:v.share,memo:v.memo,conf:high?"high":"mid",src:"history",why:`Seen ${v.n}× before${v.n>1?`, ${Math.round(Math.min(v.agreeL,v.agreeS)*100)}% the same way`:""}.`};
+  }
+  const mid=matchRule(row,n,"mid");if(mid)return ruleResult(mid,row,idx,n);
+  for(const r of RULES)if(r.re.test(row.desc))return {...r.p,memo:"",conf:r.conf,src:"rule",why:r.why};
+  const near=(idx.k2.get(n.k2)||[]).length?idx.k2.get(n.k2):(n.k1.length>=4?idx.k1.get(n.k1):null);
+  if(near&&near.length){const v=vote(near,row.owner);return {cat:v.cat,sub:v.sub,share:v.share,memo:v.memo,conf:"mid",src:"similar",why:`Similar to “${n.k2||n.k1}” seen ${v.n}× before.`}}
+  return null;
+};
+/* exchange rate: month-end rate from the fx tab; in the current month only, today's GOOGLEFINANCE rate (settings fx_live_*) as a provisional stand-in */
+const thisMonth=()=>{const d=new Date();return d.getFullYear()+"-"+pad(d.getMonth()+1)};
+toSgd=function(p){
+  p.fxProv=false;if(p.cur==="SGD")return Math.round(p.orig*100)/100;
+  let r=+((ST.cfg.fx[p.m]||{})[p.cur]);
+  if(!(r>0)&&p.m===thisMonth()&&ST.fxLive[p.cur]>0){r=ST.fxLive[p.cur];p.fxProv=true}
+  return r>0?Math.round(p.orig*r*100)/100:null;
+};
+/* new merchants: one Claude call per upload (a merchant that appears on several rows is asked once), 3 nearest past rows as examples each */
+async function askClaude(list){
+  if(!list.length)return;
+  const keyOf=p=>normKey(p.desc).key||String(p.desc).toUpperCase(),groups=new Map();
+  list.forEach(p=>{const k=keyOf(p);if(!groups.has(k))groups.set(k,[]);groups.get(k).push(p)});
+  const reps=[...groups.values()].map(g=>g[0]);
+  setAsk(`Claude is classifying ${reps.length} new merchant${reps.length>1?"s":""}…`);
+  try{
+    for(let i=0;i<reps.length;i+=100){
+      const batch=reps.slice(i,i+100),ex=new Set();
+      batch.forEach(p=>nearest(p.desc,ST.idx,3).forEach(h=>ex.add(h)));
+      const exl=[...ex].map(h=>`${h.desc.slice(0,70)} | ${h.amt} | paid by ${h.owner} | ${h.cat}/${h.sub} | ${h.share}${h.memo?" | "+h.memo.slice(0,40):""}`).join("\n");
+      const prompt=`Classify household transactions for Ankit and Sejeong, a couple in Singapore (Sejeong also has Korean accounts). Learn their habits from the examples, then label each new row.
+Categories (category: sub-categories): ${JSON.stringify(TAX)}
+Share is one of: "Shared" (household spending for both), "Personal - Ankit", "Personal - Sejeong", "Excluded" (not spending: transfers between their own accounts, card bill payments, investments, savings, loan interest bookkeeping).
+Amounts are SGD; positive = money out, negative = money in (a refund or someone paying them back).
+Past examples (description | SGD | paid by | category/sub | share | memo):
+${exl}
+
+New rows (id | description | SGD | paid by):
+${batch.map(p=>`${p.id} | ${p.desc.slice(0,90)} | ${p.amt??p.orig+" "+p.cur} | ${p.owner}`).join("\n")}
+
+Reply with ONLY a JSON array of objects {"id":number,"cat":string,"sub":string,"share":string,"memo":string,"conf":number between 0 and 1,"why":string under 12 words}. memo is a 2-5 word plain note like the examples, or "".`;
+      const r=await ST.sample.json(prompt);
+      (Array.isArray(r)?r:[]).forEach(o=>{
+        const rep=batch.find(b=>b.id===+o.id);if(!rep||!TAX[o.cat]||!TAX[o.cat].includes(o.sub)||!SHARES.includes(o.share))return;
+        const memo=String(o.memo||""),why="New merchant. Claude: "+String(o.why||"").slice(0,90);
+        (groups.get(keyOf(rep))||[rep]).forEach(p=>{p.pred={cat:o.cat,sub:o.sub,share:o.share,memo,conf:(+o.conf>=0.85?"mid":"low"),src:"claude",why};p.lab={cat:o.cat,sub:o.sub,share:o.share,memo}});
+      });
+      renderReview();
+    }
+  }catch(e){console.error(e);banner(errMsg(e)+" The remaining new merchants need a category picked by hand.")}
+  list.filter(p=>!p.pred).forEach(p=>{p.pred={cat:"ETC",sub:"Etc",share:"Shared",memo:"",conf:"low",src:"none",why:"New merchant. Please pick a category."};p.lab={...p.pred}});
+  setAsk("");renderReview();
+}
+function checkSource(x,src){
+  const s=String(src||"").toLowerCase().replace(/[^a-z0-9가-힣 ]/g," ");if(!s.trim())return;
+  const toks=String(x.acct).toLowerCase().replace(/[^a-z0-9가-힣 ]/g," ").split(/\s+/).filter(t=>t.length>=3&&!/^(card|account|acct|ankit|sejeong|joint)$/.test(t));
+  if(toks.length&&!toks.some(t=>s.includes(t)))x.warn=`This looks like “${src}”, not ${x.acct}. Check the account.`;
+}
+function setAsk(t){ST.ask=t||"";const el=$("ask");if(el)el.textContent=ST.ask}
+
+/* statement extraction: Haiku first; if the printed total disagrees, only that file is re-read by Sonnet */
+function extractPrompt(acct,src){
+  return `You are extracting transactions from a ${src} of a personal bank or card account (the user says it is "${acct.name}", default currency ${acct.currency}). The statement month is ${ST.month}.
+Return ONLY a JSON object: {"source":"the bank, card or app name visible in the document, or empty if none is shown","total":{"out":123.45,"in":0}|null,"rows":[{"date":"YYYY-MM-DD","desc":"merchant or description exactly as printed","amount":12.34,"dir":"out"|"in","cur":"SGD"}]}.
+Rules:
+- amount is a positive number in the currency the account is charged in. For foreign spending on an SGD card use the SGD amount, not the foreign one. Korean statements are KRW.
+- dir "out" = purchases, fees, interest charged, transfers or payments sent; "in" = refunds, cashback, credits, money received, card payments received.
+- total = the statement's own printed totals (for example total new charges, total debits, total credits), as positive numbers in the account currency. out = total money out, in = total money in. Copy them from the document; never add rows up yourself. Use null for a figure that is not printed, or null for the whole total if none is printed.
+- Skip opening/closing balances, running balance columns, subtotals, minimum payment lines, reward points, and anything that is not a single transaction.
+- If the year is not printed, use the year that puts the date in or just before ${ST.month}.
+- No prose, no markdown fences.`;
+}
+async function extractVerified(x,acct,src,parts){
+  const run=async model=>{
+    let rows=[],tot=null,out=0,inn=0;
+    for(const part of parts){
+      const prompt=extractPrompt(acct,src);
+      const imgs=part.images||(part.image?[part.image]:null);
+      const content=imgs?[...imgs.map(im=>({type:"image",source:im})),{type:"text",text:prompt}]:prompt+"\n\n"+part.text;
+      const r=await gs("callClaude",model,"You extract bank statement data. Reply with JSON only.",content,8000);
+      const j=parseJson(r.text);const arr=Array.isArray(j)?j:(j&&Array.isArray(j.rows)?j.rows:[]);
+      rows=rows.concat(fromLLM(j,acct,x));
+      arr.forEach(q=>{const a=Math.abs(+q.amount);if(!isFinite(a)||!q.desc)return;if(q.dir==="in")inn+=a;else out+=a});
+      if(tot==null&&j&&j.total&&typeof j.total==="object"&&j.total.out!=null&&isFinite(+j.total.out))tot=+j.total.out;
+    }
+    return {rows,out,inn,tot};
+  };
+  const verdict=r=>r.tot==null?"none":(Math.abs(r.out-r.tot)<=0.01||Math.abs(r.out-r.inn-r.tot)<=0.01)?"ok":"off";
+  const m1=S("model_extract","claude-haiku-5-5"),m2=S("model_retry","claude-sonnet-5-5");
+  x.st="asking";x.model=modelLabel(m1);renderFiles();
+  let r=await run(m1),v=verdict(r),retried=false;
+  if(v==="off"){retried=true;x.model=modelLabel(m1)+" → "+modelLabel(m2);renderFiles();r=await run(m2);v=verdict(r)}
+  const who=retried?`${modelLabel(m1)} total was off → re-read with ${modelLabel(m2)}`:modelLabel(m1);
+  if(v==="ok")x.note=`${who} · total matches statement ✓`;
+  else if(v==="none")x.note=`${who} · no printed total to check, so look over the rows`;
+  else{x.note=`⚠ ${who} · rows add up to ${money(r.out)} but the statement says ${money(r.tot)}. Check the rows.`;x.flag=true}
+  return r.rows;
+}
+async function pdfPageImages(pdf){
+  const out=[];if(!pdf)return out;
+  for(let p=1;p<=Math.min(pdf.numPages,12);p++){
+    const pg=await pdf.getPage(p),v0=pg.getViewport({scale:1}),vp=pg.getViewport({scale:Math.min(2,1600/Math.max(v0.width,v0.height))});
+    const c=document.createElement("canvas");c.width=Math.round(vp.width);c.height=Math.round(vp.height);
+    await pg.render({canvasContext:c.getContext("2d"),viewport:vp}).promise;
+    out.push({type:"base64",media_type:"image/jpeg",data:c.toDataURL("image/jpeg",0.85).split(",")[1]});
+  }
+  return out;
+}
+async function readPdf(x,acct){
+  const pages=await pdfText(x);
+  const chunks=[];let cur="";for(const p of pages){if(cur.length+p.length>40000&&cur){chunks.push(cur);cur=""}cur+=p+"\n\n"}if(cur.trim())chunks.push(cur);
+  if(!chunks.length){ /* scanned or image-only PDF: draw the pages and read them as images, same checks as a screenshot */
+    const imgs=await pdfPageImages(x.pdfDoc);
+    if(!imgs.length)throw {msg:"This PDF has no readable text. Upload a screenshot of it instead."};
+    const parts=[];for(let i=0;i<imgs.length;i+=6)parts.push({images:imgs.slice(i,i+6)});
+    return extractVerified(x,acct,"PDF statement (page images attached)",parts);
+  }
+  return extractVerified(x,acct,"PDF statement (text below)",chunks.map(ch=>({text:"STATEMENT TEXT:\n"+ch})));
+}
+function fileImage(f){
+  return new Promise((ok,no)=>{
+    const rd=new FileReader();rd.onerror=()=>no({msg:"Couldn't open this image."});
+    rd.onload=()=>{
+      const url=rd.result,type=f.type||"image/png";
+      if(f.size<1500000&&/^image\/(png|jpeg|webp|gif)$/.test(type))return ok({type:"base64",media_type:type,data:String(url).split(",")[1]});
+      const im=new Image();im.onerror=()=>no({msg:"This image format isn't supported. Use PNG or JPG."});
+      im.onload=()=>{const k=Math.min(1,2400/Math.max(im.width,im.height));const c=document.createElement("canvas");c.width=Math.round(im.width*k);c.height=Math.round(im.height*k);
+        c.getContext("2d").drawImage(im,0,0,c.width,c.height);ok({type:"base64",media_type:"image/jpeg",data:c.toDataURL("image/jpeg",0.9).split(",")[1]})};
+      im.src=url};
+    rd.readAsDataURL(f)});
+}
+async function readImage(x,acct){
+  const img=await fileImage(x.f);
+  return extractVerified(x,acct,"screenshot of a banking or card app (attached image)",[{image:img}]);
+}
+
+/* ---------- loading ---------- */
+function load(b){
+  ST.me={email:b.email,name:b.name};
+  ST.S={};toObjs(b.settings).forEach(o=>{ST.S[String(o.key).trim()]=o.value});
+  ST.accts=toObjs(b.accounts).filter(a=>a.name).map(a=>({...a,name:String(a.name).trim(),owner:String(a.owner).trim(),currency:String(a.currency||"SGD").trim()}));
+  ST.cfg.fx={};toObjs(b.fx).forEach(o=>{const m=String(o.month).slice(0,7),c=String(o.currency).trim();if(m&&c)(ST.cfg.fx[m]=ST.cfg.fx[m]||{})[c]=o.rate_to_sgd});
+  const rA=parseFloat(ST.S.ratio_ankit);ST.cfg.ratio={Ankit:isFinite(rA)?rA:0.6};ST.cfg.ratio.Sejeong=1-ST.cfg.ratio.Ankit;
+  ST.cfg.income={Sejeong:parseFloat(ST.S.income_sejeong)||0,Ankit:parseFloat(ST.S.income_ankit)||0};
+  ST.hist=b.transactions.slice(1).map(rowFromSheet).filter(h=>h.id&&h.status!=="deleted");
+  ST.rules=toObjs(b.rules).filter(r=>r.key);
+  ST.fxLive={};["KRW","INR","USD"].forEach(c=>{const v=parseFloat(ST.S["fx_live_"+c]);if(v>0)ST.fxLive[c]=v});
+  ST.usage=b.usage;reindex();
+  const months=[...new Set(ST.hist.map(h=>h.m))].sort();ST.mMonth=months.length?months[months.length-1]:ST.month;
+  ST.loaded=true;
+}
+async function boot(){
+  renderAll();
+  try{load(await gs("getBootstrap"));banner("")}catch(e){banner(errMsg(e))}
+  renderAll();
+}
+async function refreshUsage(){try{ST.usage=await gs("getUsage");if(ST.view==="settings")renderSettings()}catch(e){}}
+
+/* ---------- navigation ---------- */
+const pendingLeft=()=>ST.pend.filter(p=>p.st==="pending").length;
+function go(v){ST.view=v;renderAll()}
+function renderNav(){
+  $("who").textContent=ST.me.name||"…";
+  const tabs=[["upload","Upload"],["review","Review"+(ST.pend.length?" · "+pendingLeft():"")],["month","Month"],["settings","Settings"]];
+  $("tabs").innerHTML=tabs.map(([k,l])=>`<button class="${ST.view===k?"on":""}" data-c="tab" data-id="${k}">${esc(l)}</button>`).join("");
+  ["upload","review","month","settings"].forEach(k=>{$("v-"+k).hidden=ST.view!==k});
+}
+function renderAll(){renderNav();({upload:renderUpload,review:renderReviewView,month:renderMonth,settings:renderSettings})[ST.view]();renderFoot()}
+function renderFoot(){
+  const f=$("foot");
+  if(ST.view==="upload"){
+    const queued=ST.files.filter(x=>x.st==="queued"||x.st==="error"&&x.again).length,read=ST.pend.length;
+    f.hidden=false;
+    f.innerHTML=`<div><div class="footl"><span id="ask">${esc(ST.ask)}</span>${ST.ask?"":`${read} rows read · ${queued} file${queued===1?"":"s"} waiting`}</div>`+
+      (queued?`<button class="btn ml" data-c="run" ${ST.busy?"disabled":""}>${ST.busy?"Working…":"Classify → Review"}</button>`:read?`<button class="btn ml" data-c="tab" data-id="review">Go to Review</button>`:"")+`</div>`;
+  }else if(ST.view==="review"){
+    const ok=ST.pend.filter(p=>p.st==="ok").length,rj=ST.pend.filter(p=>p.st==="rej").length;
+    f.hidden=!ST.pend.length;
+    f.innerHTML=`<div><div class="footl mono">✓ ${ok} · ✕ ${rj} · left ${pendingLeft()}</div><button class="btn ml" data-c="save" ${ST.busy||!ok?"disabled":""}>${ST.busy?"Saving…":"Save to sheet"}</button></div>`;
+  }else f.hidden=true;
+}
+function renderReview(){renderNav();if(ST.view==="review")renderReviewView();if(ST.view==="upload")renderFoot()}
+
+/* ---------- Upload ---------- */
+function acctDone(a,m){return ST.hist.some(h=>h.acct===a.name&&h.m===m&&h.status!=="provisional")||ST.files.some(x=>x.acct===a.name&&x.month===m&&x.st==="done")}
+function guessAcct(name){
+  const n=name.toLowerCase().replace(/[^a-z0-9가-힣]/g,"");let best=null,bs=0;
+  for(const a of ST.accts){const k=a.name.toLowerCase().replace(/[^a-z0-9가-힣]/g,"");if(k.length>bs&&n.includes(k)){best=a;bs=k.length}}
+  if(best)return best.name;
+  const cand=[...myAccts(),...jointAccts()];let sc=0;
+  for(const a of cand){const toks=a.name.toLowerCase().split(/[^a-z0-9가-힣]+/).filter(t=>t.length>=3&&!/^(card|account|acct|ankit|sejeong|joint)$/.test(t));const s=toks.filter(t=>n.includes(t)).length;if(s>sc){sc=s;best=a}}
+  return best?best.name:"";
+}
+function guessMonth(name){
+  const n=name.toLowerCase(),M="jan feb mar apr may jun jul aug sep oct nov dec".split(" ");let m;
+  /* a statement dated in the first week of a month (2026-10-01_Statement.pdf) covers the month before */
+  if((m=n.match(/(20\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-7])(?!\d)/))){const d=new Date(+m[1],+m[2]-2,1);return d.getFullYear()+"-"+pad(d.getMonth()+1)}
+  if(m=n.match(/(20\d{2})[-_. ]?(0[1-9]|1[0-2])(?!\d)/))return m[1]+"-"+m[2];
+  if(m=n.match(/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-_ .]?(20\d{2})/))return m[2]+"-"+pad(M.indexOf(m[1])+1);
+  if(m=n.match(/(20\d{2})[-_ .]?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/))return m[1]+"-"+pad(M.indexOf(m[2])+1);
+  return ST.month;
+}
+function addFiles(list){
+  for(const f of list){
+    const ext=(f.name.split(".").pop()||"").toLowerCase();
+    const kind=/^(csv|tsv|xlsx|xls)$/.test(ext)?"table":ext==="pdf"?"pdf":/^image\//.test(f.type)||/^(png|jpe?g|webp|gif)$/.test(ext)?"image":"";
+    const x={id:++ST.fid,f,name:f.name,ext:(ext||"?").toUpperCase().slice(0,4),kind,acct:guessAcct(f.name),month:guessMonth(f.name),st:kind?"queued":"error",note:"",err:kind?"":"This file type isn't supported. Use CSV, Excel, PDF or an image.",rows:0,model:"",warn:"",flag:false,pwv:""};
+    ST.files.push(x);
+  }
+  renderUpload();
+}
+function renderCheck(){
+  const accts=[...myAccts(),...jointAccts()],done=accts.filter(a=>acctDone(a,ST.month));
+  $("up-check").innerHTML=`<div class="row"><b style="font-size:14px">${esc(monthLabel(ST.month))} statements</b><span class="mono ml" style="font-size:12px;color:var(--green)">${done.length} / ${accts.length} done</span></div>
+    <div class="row"><span class="sub">Statement month</span><input type="month" class="inp" value="${ST.month}" data-g="upmonth"></div>
+    <div class="pills">${accts.map(a=>`<span class="pill ${done.includes(a)?"on":""}">${done.includes(a)?"✓ ":""}${esc(a.name)}${a.owner==="Joint"?" (Joint)":""}</span>`).join("")||`<span class="sub">No accounts found for ${esc(ST.me.name)}.</span>`}</div>`;
+}
+function renderFiles(){
+  const opts=sel=>[...myAccts(),...jointAccts(),...ST.accts.filter(a=>a.owner!==ST.me.name&&a.owner!=="Joint"&&uploadable(a))]
+    .map(a=>`<option value="${esc(a.name)}" ${a.name===sel?"selected":""}>${esc(a.name)}${a.owner!==ST.me.name?" · "+esc(a.owner):""}</option>`).join("");
+  const stTxt=x=>({queued:"Ready",reading:"Reading…",asking:"Asking "+x.model+"…",password:"Needs password",done:x.rows+" rows",error:"Couldn't read"})[x.st];
+  const stCol=x=>x.st==="done"?"var(--green)":x.st==="error"?"var(--red)":"#8a5a14";
+  $("up-files").innerHTML=ST.files.map(x=>{
+    const edit=x.st==="queued"||x.st==="error";
+    return `<div class="file ${x.warn||x.flag||x.st==="password"?"warn":""}">
+      <div class="row"><span class="ext">${esc(x.ext)}</span><span class="fname">${esc(x.name)}</span><span class="fst ml" style="color:${stCol(x)}">${esc(stTxt(x))}</span></div>
+      ${edit?`<div class="row"><select class="sel" style="flex:1" data-g="facct" data-id="${x.id}"><option value="">Pick account…</option>${opts(x.acct)}</select><input type="month" class="inp" value="${x.month}" data-g="fmonth" data-id="${x.id}"></div>`
+        :`<div class="sub">${esc(x.acct)} · ${esc(monthLabel(x.month))}</div>`}
+      ${x.note?`<div class="note ${x.flag?"amber":""}">${esc(x.note)}</div>`:""}
+      ${x.warn?`<div class="note amber">${esc(x.warn)}</div>`:""}
+      ${x.err?`<div class="note red">${esc(x.err)}</div>`:""}
+      ${x.st==="password"?`<div class="row"><input type="password" class="inp" style="flex:1" placeholder="PDF password" aria-label="PDF password" data-i="pw" data-id="${x.id}"><button class="btn ghost sm" data-c="unlock" data-id="${x.id}">Unlock</button></div><div class="note">Unlocked on this device. The password is never sent or saved.</div>`:""}
+      ${edit?`<div class="row">${x.st==="error"&&x.kind?`<button class="link" data-c="retry" data-id="${x.id}">Try again</button>`:""}<button class="link ml" data-c="rmfile" data-id="${x.id}">Remove</button></div>`:""}
+    </div>`}).join("");
+}
+function renderUpload(){renderCheck();renderFiles();renderFoot()}
+
+async function readOne(x){
+  const acct=acctOf(x.acct),keep=ST.month;ST.month=x.month;
+  x.st="reading";x.note="";x.err="";x.warn="";x.flag=false;renderFiles();
+  try{
+    let rows;
+    if(x.kind==="table"){rows=await readTable(x.f,acct);x.note="Read on this device. No AI used."}
+    else if(x.kind==="pdf")rows=await readPdf(x,acct);
+    else rows=await readImage(x,acct);
+    if(!rows.length)throw {msg:"No transactions found in this file."};
+    /* statement month = the month most transactions fall in, unless the month was picked by hand */
+    const cnt={};rows.forEach(r=>{const k=String(r.d||"").slice(0,7);if(k)cnt[k]=(cnt[k]||0)+1});
+    const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
+    if(top&&!x.monthSet&&top[0]!==x.month){x.month=top[0];ST.month=top[0];x.note=(x.note?x.note+" ":"")+"Month set to "+monthLabel(top[0])+" from the transaction dates."}
+    const ps=rows.map(r=>mkPending(r,acct,x.name));ps.forEach(p=>{p.fileKey=x.id});
+    x.st="done";x.rows=rows.length;return ps;
+  }catch(e){x.st="error";x.again=false;x.err=errMsg(e);return []}
+  finally{ST.month=keep;renderFiles()}
+}
+async function runAll(){
+  if(ST.busy)return;
+  const todo=ST.files.filter(x=>x.st==="queued"||(x.st==="error"&&x.again));
+  const miss=todo.find(x=>!x.acct);if(miss){banner(`Pick an account for ${miss.name} first.`);return}
+  banner("");ST.busy=true;renderUpload();
+  try{
+    const fresh=[];
+    for(const x of todo){const ps=await readOne(x);fresh.push(...ps)}
+    markDups(fresh);fresh.filter(p=>/^Already saved/.test(p.dup)).forEach(p=>{p.st="rej"});
+    ST.pend.push(...fresh);linkFees(fresh);
+    const gone=[...new Set(fresh.filter(p=>p.amt==null).map(p=>p.cur+" "+p.m))];
+    await askClaude(fresh.filter(p=>!p.pred&&!p.fee));
+    linkFees(fresh);
+    fresh.forEach(p=>{if(!p.lab){p.pred={cat:"ETC",sub:"Etc",share:"Shared",memo:"",conf:"low",src:"none",why:"No suggestion. Please pick a category."};p.lab={cat:"ETC",sub:"Etc",share:"Shared",memo:""}}});
+    if(gone.length)banner(`No exchange rate for ${gone.join(", ")}. Add it in Settings before saving.`);
+    refreshUsage();
+  }catch(e){banner(errMsg(e))}
+  ST.busy=false;setAsk("");
+  if(ST.pend.length)go("review");else renderUpload();
+}
+
+/* ---------- Review ---------- */
+const isConf=p=>p.pred&&p.pred.conf==="high"&&!p.dup&&p.amt!=null;
+function inFlt(p){return ST.flt==="mine"?p.owner===ST.me.name:ST.flt==="joint"?p.owner==="Joint":p.owner===otherName()}
+function amtText(p){
+  const o=p.orig,a=Math.abs(o),s=o>0?"−":"+";
+  if(p.cur==="SGD")return s+money(a);
+  const sym={KRW:"₩",INR:"₹",USD:"US$"}[p.cur]||p.cur+" ";
+  return s+sym+money(a,p.cur==="KRW"?0:2);
+}
+function rowHtml(p){
+  const L=p.lab||{},conf=p.pred?p.pred.conf:"low",dot=conf==="high"?"var(--green)":conf==="mid"?"var(--amber)":"var(--red)";
+  const why=(p.dup?p.dup+". ":"")+(p.pred?p.pred.why:"")+(p.cur!=="SGD"?(p.amt==null?` No ${p.cur} rate for ${p.m}.`:` ≈ S$${money(Math.abs(p.amt))}${p.fxProv?" (today's rate, provisional)":""}`):"");
+  const opts=Object.entries(TAX).map(([c,subs])=>subs.map(s=>`<option value="${esc(c+"|"+s)}" ${L.cat===c&&L.sub===s?"selected":""}>${esc(c+" · "+s)}</option>`).join("")).join("");
+  return `<div class="tx ${p.st==="ok"?"ok":p.st==="rej"?"rej":""}">
+    <div class="txr"><div class="txd mono">${esc(p.d.slice(5).replace("-","/"))}</div><div class="txm"><b>${esc(p.desc)}</b><span class="sub">${esc(p.acct)}</span></div><div class="txa mono" style="color:${p.orig<0?"var(--green)":"inherit"}">${esc(amtText(p))}</div></div>
+    <div class="txc"><span class="tag">${esc((L.cat||"")+" · "+(L.sub||""))}</span><span class="tag ${L.share==="Shared"?"g":""}">${esc(L.share||"")}</span>${L.memo?`<span class="tag">${esc(L.memo)}</span>`:""}</div>
+    <div class="txw"><span class="dot" style="background:${dot}"></span><span class="why">${esc(why)}</span>
+      <button class="ib ${p.st==="ok"?"on":""}" aria-label="Approve" data-c="ok" data-id="${p.id}">✓</button>
+      <button class="ib ${p.st==="rej"?"on":""}" style="${p.st==="rej"?"background:#5c635d;border-color:#5c635d":""}" aria-label="Reject" data-c="rej" data-id="${p.id}">✕</button>
+      <button class="ib" style="${p.edit?"border-color:var(--ink);color:var(--ink)":""}" aria-label="Edit" data-c="edit" data-id="${p.id}">✎</button></div>
+    ${p.edit?`<div class="edit"><label>Category<select class="sel" data-g="cat" data-id="${p.id}">${opts}</select></label>
+      <label>Whose<select class="sel" data-g="share" data-id="${p.id}">${SHARES.map(s=>`<option ${L.share===s?"selected":""}>${esc(s)}</option>`).join("")}</select></label>
+      <label class="wide">Memo<input class="inp" value="${esc(L.memo||"")}" data-i="memo" data-id="${p.id}"></label>
+      <label class="chk wide"><input type="checkbox" ${p.learn?"checked":""} data-g="learn" data-id="${p.id}">Always file this merchant this way</label></div>`:""}
+  </div>`;
+}
+function renderReviewView(){
+  if(!ST.pend.length){$("rv-top").innerHTML=`<div class="card"><div class="sub">Nothing to review. Add statements on the Upload tab.</div></div>`;$("rv-list").innerHTML="";$("rv-conf").innerHTML="";renderFoot();return}
+  const list=ST.pend.filter(inFlt),cnt=f=>ST.pend.filter(p=>p.st==="pending"&&(f==="mine"?p.owner===ST.me.name:f==="joint"?p.owner==="Joint":p.owner===otherName())).length;
+  const conf=list.filter(isConf),look=list.filter(p=>!isConf(p)),bulk=conf.filter(p=>p.st==="pending");
+  $("rv-top").innerHTML=`<div class="chips">${[["mine","My accounts"],["joint","Joint"],["other",otherName()]].map(([k,l])=>`<button class="chip ${ST.flt===k?"on":""}" data-c="flt" data-id="${k}">${esc(l)} · ${cnt(k)}</button>`).join("")}</div>
+    ${bulk.length?`<div class="bulk"><div><b>${bulk.length} row${bulk.length>1?"s":""}</b> match how you filed them before.</div><button class="btn sm ml" style="white-space:nowrap" data-c="approveAll">Approve all ${bulk.length}</button></div>`:""}
+    <div class="hd">Needs a look<span class="mono">${look.length}</span></div>`;
+  $("rv-list").innerHTML=look.map(rowHtml).join("")||`<div class="sub" style="padding:10px 0">Nothing needs a look here.</div>`;
+  $("rv-conf").innerHTML=`<div class="row" style="padding:12px 0;align-items:baseline"><b>Confident</b><span class="mono sub">${conf.length}${ST.showConf?"":" · hidden"}</span><button class="link ml" data-c="showConf">${ST.showConf?"Hide":"Show"}</button></div>${ST.showConf?conf.map(rowHtml).join(""):""}`;
+  renderFoot();
+}
+function pById(id){return ST.pend.find(p=>p.id===+id)}
+function approve(p){
+  p.st="ok";
+  if(p.edit&&p.learn&&p.lab){
+    const n=normKey(p.desc),sh=p.lab.share;
+    if(n.key){
+      const rule={key:n.key,cat:p.lab.cat,sub:p.lab.sub,share:(sh==="Shared"||sh==="Excluded")?sh:(sh==="Personal - "+p.owner?"Owner":sh),memo:p.lab.memo||"",conf:"high",note:"Learned in Review"};
+      gs("saveRule",rule).then(()=>{
+        const row={...rule,set_by:ST.me.email,set_at:new Date().toISOString().slice(0,19)},i=ST.rules.findIndex(r=>r.key===rule.key);
+        if(i>=0)ST.rules[i]=row;else ST.rules.push(row);compileRules();
+      }).catch(e=>banner("Couldn't save the rule: "+errMsg(e)));
+    }
+  }
+  p.edit=false;
+}
+const newId=p=>"L2"+p.d.replace(/-/g,"")+Math.random().toString(36).slice(2,8);
+async function saveAll(){
+  const ok=ST.pend.filter(p=>p.st==="ok");if(!ok.length||ST.busy)return;
+  const noRate=ok.filter(p=>p.amt==null);
+  if(noRate.length){banner(`No exchange rate for ${[...new Set(noRate.map(p=>p.cur))].join(", ")} in ${noRate[0].m}. Add it in Settings.`);return}
+  banner("");ST.busy=true;renderFoot();
+  try{
+    const ids=new Map();ok.forEach(p=>ids.set(p.id,newId(p)));
+    const mk=p=>({id:ids.get(p.id),d:p.d,desc:p.desc,amt:p.amt,cur:p.cur,orig:p.orig,acct:p.acct,card:"",owner:p.owner,share:p.lab.share,cat:p.lab.cat,sub:p.lab.sub,memo:p.lab.memo||"",m:p.m,source:"ledger-v2",posted:"",status:p.fxProv?"provisional":"final",mcc:"",channel:"",xref:(p.parent&&ids.get(p.parent))||"",ref:{row:null}});
+    const groups=new Map();ok.forEach(p=>{const k=p.acct+"§"+p.m;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(p)});
+    let saved=0;
+    for(const [k,ps] of groups){
+      const [acct,m]=k.split("§"),hs=ps.map(mk);
+      await gs("saveRows",hs.map(rowToSheet),{account:acct,month:m,file:[...new Set(ps.map(p=>p.file))].join(", ")});
+      for(const p of ps){if(p.confirms){try{await gs("deleteRow",p.confirms.id);ST.hist=ST.hist.filter(h=>h!==p.confirms)}catch(e){}}}
+      ST.hist.push(...hs);ST.pend=ST.pend.filter(p=>!ps.includes(p));saved+=hs.length;
+    }
+    ST.pend=ST.pend.filter(p=>p.st==="pending");
+    reindex();ST.mMonth=ok[0].m;refreshUsage();
+    banner("");ST.busy=false;
+    ST.view=ST.pend.length?"review":"month";renderAll();
+    const b=$("banner");b.hidden=false;b.style.background="#e3eee8";b.style.borderColor="#9fd3b8";b.style.color="#1f4d3b";b.innerHTML=`<div style="flex:1">Saved ${saved} row${saved===1?"":"s"} to the sheet.</div><button class="link" data-c="closeBanner" style="padding:0">✕</button>`;
+    return;
+  }catch(e){banner(errMsg(e)+" Rows saved so far are in the sheet; the rest are still here.")}
+  ST.busy=false;renderAll();
+}
+
+/* ---------- Month ---------- */
+function renderMonth(){
+  const el=$("v-month");
+  if(!ST.loaded){el.innerHTML=`<div class="card sub">Loading…</div>`;return}
+  const months=[...new Set([...ST.hist.map(h=>h.m),ST.mMonth].filter(Boolean))].sort().reverse(),m=ST.mMonth||months[0];
+  if(!m){el.innerHTML=`<div class="card sub">No transactions yet.</div>`;return}
+  const R=monthRows(m),s=stats(R),st=settle(R),info=monthInfo(m),prev=stats(monthRows(shiftMonth(m,-1)));
+  const fmt=n=>money(n),d=pct(s.total,prev.total);
+  /* Ready for MGM */
+  const mgm=PEOPLE.map(p=>{
+    const as=ST.accts.filter(a=>a.owner===p&&uploadable(a)),up=as.filter(a=>R.some(h=>h.acct===a.name&&h.status!=="provisional")).length;
+    const left=R.filter(h=>h.owner===p&&h.status==="provisional").length+(p===ST.me.name?ST.pend.filter(x=>x.owner===p&&x.m===m&&x.st!=="rej").length:0);
+    return {p,up,n:as.length,left,ok:up===as.length&&!left}});
+  /* settlement */
+  const from=st.balA>0?"Ankit":"Sejeong",to=st.balA>0?"Sejeong":"Ankit";
+  /* one income */
+  const inc=ST.cfg.income.Sejeong,usedPct=inc>0?info.exT/inc*100:0,tone=usedPct<=90?["On track","var(--green)","var(--greenbg)"]:usedPct<=100?["Close","#8a5a14","var(--amberbg)"]:["Over","var(--red)","#fbeee6"];
+  /* spending bars */
+  const key=ST.mView==="cat"?h=>h.cat+" · "+h.sub:whoOf,groups={};
+  s.sp.forEach(h=>{const k=key(h),g=groups[k]=groups[k]||{k,v:0,by:{},n:0};g.v+=h.amt;g.n++;const w=whoOf(h);g.by[w]=(g.by[w]||0)+h.amt});
+  const list=Object.values(groups).sort((a,b)=>b.v-a.v),max=list.length?Math.max(list[0].v,1):1;
+  if(ST.mSel&&!groups[ST.mSel])ST.mSel=null;
+  const bars=list.map(g=>{const on=ST.mSel===g.k;
+    const segs=Object.keys(WHO).filter(w=>g.by[w]>0).map(w=>`<i style="width:${Math.round(g.by[w]/g.v*1000)/10}%;background:${WHO[w]}"></i>`).join("");
+    const sub=ST.mView==="cat"?Object.keys(WHO).filter(w=>g.by[w]).map(w=>w+" "+fmt(g.by[w])).join(" · "):g.n+" transactions";
+    return `<button class="bar ${on?"on":""}" data-c="mpick" data-id="${esc(g.k)}"><div class="row" style="width:100%;font-size:12.5px"><span style="font-weight:${on?600:400}">${esc(g.k)}</span><span class="mono ml">${fmt(g.v)}</span></div><div class="seg" style="width:${Math.max(4,Math.round(g.v/max*100))}%">${segs}</div><div class="sub" style="font-size:11px">${esc(sub)}</div></button>`}).join("");
+  const shown=s.sp.filter(h=>!ST.mSel||key(h)===ST.mSel).sort((a,b)=>b.amt-a.amt),cap=ST.mAll?shown.length:80;
+  el.innerHTML=`
+    <div class="row"><select class="sel" style="font-size:18px;font-weight:600;border:0;background:none;padding:0" data-g="mmonth">${months.map(x=>`<option value="${x}" ${x===m?"selected":""}>${esc(monthLabel(x))}</option>`).join("")}</select></div>
+    <div class="total"><div class="row"><span style="font-size:12px;letter-spacing:.06em;color:#c9cfc6">TOTAL SPENT</span>${d==null?"":`<span class="mono ml" style="font-size:11.5px;color:#9fd3b8">${d>0?"+":""}${d}% vs ${esc(monthLabel(shiftMonth(m,-1)).split(" ")[0])}</span>`}</div>
+      <div class="big mono">S$${fmt(s.total)}</div>
+      <div class="grid3">${[["Shared",s.shared],["Ankit",s.pa],["Sejeong",s.ps]].map(([k,v])=>`<div><div style="font-size:11px;color:#c9cfc6"><span class="sq" style="background:${WC[k]}"></span>${k}</div><div class="mono" style="font-size:13.5px">${fmt(v)}</div></div>`).join("")}</div></div>
+    <div class="card"><h3>Ready for MGM?</h3><div class="grid2">${mgm.map(g=>`<div style="background:${g.ok?"var(--greenbg)":"var(--amberbg)"};border-radius:8px;padding:8px 10px"><div style="font-size:12px;color:${g.ok?"#1f4d3b":"#7a4f12"}">${g.p}</div><div class="mono" style="font-size:13px">${g.up}/${g.n} uploaded · ${g.left} left</div></div>`).join("")}</div></div>
+    <div class="card"><div class="sub" style="letter-spacing:.04em">SETTLEMENT · ${Math.round(st.rA*100)} / ${Math.round(st.rS*100)}</div>
+      <div style="font-size:20px;font-weight:600">${Math.abs(st.balA)<0.005?"All square":`${from} → ${to} <span class="mono" style="font-weight:500">S$${fmt(Math.abs(st.balA))}</span>`}</div>
+      <div class="sub">Joint-account spending is left out. Updates as rows are approved.</div></div>
+    <div class="card"><div class="row"><h3>Living on one income</h3>${inc>0?`<span class="ml" style="font-size:11.5px;color:${tone[1]};border:1px solid ${tone[1]};background:${tone[2]};border-radius:999px;padding:1px 8px">${tone[0]}</span>`:""}</div>
+      ${inc>0?`<div class="meter"><i style="width:${Math.min(100,usedPct)}%;background:${tone[1]}"></i></div><div class="sub">${Math.round(usedPct)}% of Sejeong's take-home, travel excluded</div>`:`<div class="sub">Add income_sejeong in the settings tab to see this.</div>`}</div>
+    <div class="card"><div class="row"><h3>Spending</h3><div class="tgl ml"><button class="${ST.mView==="cat"?"on":""}" data-c="mview" data-id="cat">By category</button><button class="${ST.mView==="who"?"on":""}" data-c="mview" data-id="who">By person</button></div></div>
+      <div class="row" style="gap:12px;flex-wrap:wrap;font-size:11.5px;color:var(--mute2)">${Object.keys(WHO).map(k=>`<span><span class="sq" style="width:10px;height:10px;background:${WHO[k]}"></span>${k==="Shared"?"Shared":k+" personal"}</span>`).join("")}</div>
+      ${bars||`<div class="sub">No spending rows.</div>`}</div>
+    <div class="card" style="gap:4px"><div class="row hd" style="gap:8px"><span style="margin:0;color:var(--ink);font-size:13px;font-weight:600">${esc(ST.mSel||"All transactions")}</span><span class="mono" style="margin:0">${shown.length}</span>${ST.mSel?`<button class="link ml" data-c="mclear">Show all</button>`:""}</div>
+      ${shown.slice(0,cap).map(h=>`<div class="txr" style="padding:8px 0;border-bottom:1px solid #eef0eb"><div class="txd mono" style="width:38px">${esc(h.d.slice(5).replace("-","/"))}</div><div class="txm"><b style="font-size:13px">${esc(h.desc)}</b><span class="sub" style="font-size:11px"><span class="sq" style="background:${WHO[whoOf(h)]}"></span>${esc(whoOf(h))} · ${esc(h.cat+" · "+h.sub)} · ${esc(h.acct)}</span></div><div class="txa mono" style="font-size:13px">${fmt(h.amt)}</div></div>`).join("")}
+      ${shown.length>cap?`<button class="link" data-c="mall">Show all ${shown.length}</button>`:""}</div>
+    <button class="btn" data-c="dl">Download Excel</button>`;
+}
+function downloadMonth(){
+  const m=ST.mMonth,R=monthRows(m);
+  const ws=XLSX.utils.json_to_sheet(R.map(h=>({Date:h.d,Description:h.desc,SGD:h.amt,Currency:h.cur,Original:h.orig,Account:h.acct,Owner:h.owner,Share:h.share,Category:h.cat,Sub:h.sub,Memo:h.memo,Status:h.status})));
+  const cats=catTotals(R),ws2=XLSX.utils.json_to_sheet(Object.entries(cats).sort((a,b)=>b[1]-a[1]).map(([k,v])=>({Category:k,SGD:Math.round(v*100)/100})));
+  const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,"transactions");XLSX.utils.book_append_sheet(wb,ws2,"by category");
+  XLSX.writeFile(wb,`Household-${m}.xlsx`);
+}
+
+/* ---------- Settings ---------- */
+function renderSettings(){
+  const el=$("v-settings");
+  if(!ST.loaded){el.innerHTML=`<div class="card sub">Loading…</div>`;return}
+  const u=ST.usage||{cost:0,cap:5,calls:0},p=Math.min(100,u.cost/(u.cap||5)*100);
+  const cur=[...new Set([...ST.accts.map(a=>a.currency),...ST.pend.filter(x=>x.m===ST.month).map(x=>x.cur),...Object.keys(ST.cfg.fx[ST.month]||{})])].filter(c=>c&&c!=="SGD");
+  const rules=ST.rules.slice().sort((a,b)=>String(b.set_at).localeCompare(String(a.set_at))).slice(0,100);
+  el.innerHTML=`
+    <div class="card"><div class="row"><h3>AI usage · ${esc(monthLabel(u.month||ST.month).split(" ")[0])}</h3><span class="mono ml" style="font-size:13px">$${u.cost.toFixed(2)} / $${u.cap}</span></div>
+      <div class="meter" style="height:8px"><i style="width:${p}%;height:8px"></i></div>
+      <div class="sub">${u.calls} AI call${u.calls===1?"":"s"} this month. Stops at the limit and tells you.</div></div>
+    <div class="card"><h3>Accounts</h3>${ST.accts.map(a=>`<div class="li"><span style="flex:1;min-width:0">${esc(a.name)}</span><span class="pill">${esc(a.owner)}</span><span class="mono sub" style="width:34px;text-align:right">${esc(a.currency)}</span></div>`).join("")}</div>
+    <div class="card"><div class="row"><h3>Learned merchant rules</h3><span class="mono ml sub">${ST.rules.length}</span></div>
+      ${rules.map(r=>`<div class="li"><div style="flex:1;min-width:0"><div style="font-weight:500;overflow-wrap:anywhere">${esc(r.key)}</div><div class="sub">${esc(r.cat+" · "+r.sub+" · "+shareName(String(r.share||"").trim()))} · ${esc(String(r.conf||"mid"))} · ${r.set_by==="seed"?"preset":"set by "+esc(nameOf(r.set_by))}</div></div>${r.set_by==="seed"?"":`<button class="link" data-c="delrule" data-id="${esc(r.key)}">Delete</button>`}</div>`).join("")||`<div class="sub">No saved rules yet.</div>`}</div>
+    <div class="grid2">
+      <label class="card sub" style="gap:4px">Shared split (Ankit %)<input type="number" min="0" max="100" class="inp mono" style="width:80px" value="${Math.round(ST.cfg.ratio.Ankit*100)}" data-g="ratio"></label>
+      <div class="card sub" style="gap:4px">Month-end rates<span style="font-size:11px">Filled automatically on the last night of each month. Type a rate only to override.</span>${ST.S.fx_warning?`<span style="font-size:11.5px;color:var(--red)">${esc(ST.S.fx_warning)}</span>`:""}<input type="month" class="inp" value="${ST.month}" data-g="fxmonth">
+        ${cur.map(c=>`<div class="row"><span class="mono">${esc(c)}</span><input type="number" step="any" class="inp mono" style="flex:1" placeholder="SGD per 1 ${esc(c)}" value="${esc((ST.cfg.fx[ST.month]||{})[c]||"")}" data-g="fx" data-id="${esc(c)}"></div>`).join("")||`<span>No foreign currencies.</span>`}</div>
+    </div>`;
+}
+function recalcFx(){ST.pend.forEach(p=>{if(p.cur!=="SGD"){p.amt=toSgd(p)}})}
+
+/* ---------- events ---------- */
+document.addEventListener("click",e=>{
+  const b=e.target.closest("[data-c]");if(!b)return;const a=b.dataset.c,id=b.dataset.id;
+  const sel={
+    tab:()=>go(id),closeBanner:()=>banner(""),run:runAll,save:saveAll,
+    flt:()=>{ST.flt=id;renderReviewView()},showConf:()=>{ST.showConf=!ST.showConf;renderReviewView()},
+    approveAll:()=>{ST.pend.filter(p=>inFlt(p)&&isConf(p)&&p.st==="pending").forEach(p=>{p.st="ok"});renderReview()},
+    ok:()=>{const p=pById(id);if(p){p.st=p.st==="ok"?"pending":"ok";if(p.st==="ok"){p.st="pending";approve(p)}renderReview()}},
+    rej:()=>{const p=pById(id);if(p){p.st=p.st==="rej"?"pending":"rej";p.edit=false;renderReview()}},
+    edit:()=>{const p=pById(id);if(p){p.edit=!p.edit;if(p.edit&&p.learn===undefined)p.learn=true;renderReviewView()}},
+    rmfile:()=>{ST.files=ST.files.filter(x=>x.id!==+id);renderUpload()},
+    retry:()=>{const x=ST.files.find(x=>x.id===+id);if(x){x.again=true;x.err="";renderUpload()}},
+    unlock:()=>{const x=ST.files.find(x=>x.id===+id);if(x&&x.pwResolve)x.pwResolve(x.pwv||"")},
+    mpick:()=>{ST.mSel=ST.mSel===id?null:id;renderMonth()},mclear:()=>{ST.mSel=null;renderMonth()},mall:()=>{ST.mAll=true;renderMonth()},
+    mview:()=>{ST.mView=id;ST.mSel=null;renderMonth()},dl:downloadMonth,
+    delrule:()=>{if(!confirm("Delete this rule?"))return;gs("deleteRule",id).then(()=>{ST.rules=ST.rules.filter(r=>r.key!==id);reindex();renderSettings()}).catch(err=>banner(errMsg(err)))}
+  }[a];
+  if(sel)sel();
+});
+document.addEventListener("change",e=>{
+  const t=e.target.closest("[data-g]");if(!t)return;const a=t.dataset.g,id=t.dataset.id,v=t.value,x=ST.files.find(x=>x.id===+id),p=pById(id);
+  if(a==="upmonth"){ST.month=v||ST.month;ST.files.forEach(f=>{if(f.st==="queued")f.month=ST.month});renderUpload()}
+  else if(a==="facct"&&x){x.acct=v}
+  else if(a==="fmonth"&&x){x.month=v||x.month;x.monthSet=true}
+  else if(a==="cat"&&p){const [c,s]=v.split("|");p.lab={...p.lab,cat:c,sub:s};renderReviewView()}
+  else if(a==="share"&&p){p.lab={...p.lab,share:v};renderReviewView()}
+  else if(a==="learn"&&p){p.learn=t.checked}
+  else if(a==="mmonth"){ST.mMonth=v;ST.mSel=null;ST.mAll=false;renderMonth()}
+  else if(a==="ratio"){const r=Math.min(100,Math.max(0,parseFloat(v)));if(!isFinite(r))return;gs("saveSetting","ratio_ankit",r/100).then(()=>{ST.cfg.ratio={Ankit:r/100,Sejeong:1-r/100};banner("")}).catch(err=>banner(errMsg(err)))}
+  else if(a==="fxmonth"){ST.month=v||ST.month;renderSettings()}
+  else if(a==="fx"){const rate=parseFloat(v);if(!(rate>0))return;gs("saveFx",ST.month,id,rate).then(()=>{(ST.cfg.fx[ST.month]=ST.cfg.fx[ST.month]||{})[id]=rate;recalcFx();banner("")}).catch(err=>banner(errMsg(err)))}
+});
+document.addEventListener("input",e=>{
+  const t=e.target.closest("[data-i]");if(!t)return;const id=t.dataset.id;
+  if(t.dataset.i==="memo"){const p=pById(id);if(p)p.lab={...p.lab,memo:t.value}}
+  else if(t.dataset.i==="pw"){const x=ST.files.find(x=>x.id===+id);if(x)x.pwv=t.value}
+});
+document.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&e.target.dataset&&e.target.dataset.i==="pw"){const x=ST.files.find(x=>x.id===+e.target.dataset.id);if(x&&x.pwResolve)x.pwResolve(x.pwv||"")}
+});
+$("fileIn").addEventListener("change",e=>{addFiles([...e.target.files]);e.target.value=""});
+
+boot();
+</script>

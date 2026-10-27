@@ -1,0 +1,297 @@
+<script>
+// ===== 분류 엔진 (index.html 249-335) =====
+/* ===== Classification engine (pure functions) ===== */
+const TAX={EAT:["Work Lunch","Grocery","Dine out","Drink/Party"],LIVE:["Necessities","Rent","Utilities"],RIDE:["Public transport","Taxi"],ENJOY:["Hobbies","Travel"],WEAR:["Shopping","Beauty"],EDUCATION:["Self growth"],INVEST:["Interest","Etc"],ETC:["Events","Family","Fitness/Medical","Telco","Subscription","Insurance","Donation","Tax","Etc"]};
+const PEOPLE=["Ankit","Sejeong"];
+const SHARES=["Shared","Personal - Ankit","Personal - Sejeong","Excluded"];
+const STOP=new Set(["ICT","TRF","FROM","TO","THE","AND","OF","PAYMENT","PAYNOW","TRANSFER","POS","NETS","QR","SG","SGP","SINGAPORE","PTE","LTD","CO","INC","LLC","CORP","IB","OTHR","REF","MB","SI","FT","US","VN","KR","JP","IN","IE","GB","HK","TW","MA"]);
+function normKey(desc){
+  let s=String(desc||"").toUpperCase();
+  const incoming=/INCOMING PAYNOW|PAYNOW FROM|\bFROM:/.test(s);
+  s=s.replace(/ICT INCOMING PAYNOW REF \d+ FROM:\s*/,"")
+     .replace(/ICT PAYNOW TRANSFER \d+ TO:\s*/,"")
+     .replace(/POS NETS QR PAYMENT \d+ TO:\s*/,"")
+     .replace(/\bOTHR\b.*$/,"")
+     .replace(/^[.\s]*(SMP|OP|VNPAY|EZYPAYSGD|SQ|TST|SP|GRB|TS\/|PAYPAL\s*)\s*\*+\s*/,"")
+     .replace(/\b[A-Z]{3}\s?[\d,]+\.\d{2}\b/g," ")
+     .replace(/\(해외\)|\(주\)|㈜/g," ")
+     .replace(/[^A-Z가-힣&]+/g," ");
+  const toks=s.split(" ").filter(t=>t&&!STOP.has(t)&&!(t.length===1&&/[A-Z]/.test(t)));
+  return {key:toks.slice(0,2).join(" "),k2:toks.slice(0,2).join(" "),k1:toks[0]||"",toks,incoming};
+}
+function relShare(share,owner){
+  if(share==="Shared"||share==="Excluded")return share;
+  if(owner!=="Joint"&&share==="Personal - "+owner)return "SELF";
+  if(owner!=="Joint")return "OTHER";
+  return share;
+}
+function absShare(rel,owner){
+  if(rel==="SELF")return owner==="Joint"?"Shared":"Personal - "+owner;
+  if(rel==="OTHER")return owner==="Joint"?"Shared":"Personal - "+PEOPLE.find(p=>p!==owner);
+  return rel;
+}
+/* history rows: {d,desc,amt,acct,owner,share,cat,sub,memo,m} */
+function buildIndex(hist){
+  const idx={key:new Map(),k2:new Map(),k1:new Map(),k1n:new Map(),all:hist};
+  const push=(map,k,v)=>{if(!k)return;let a=map.get(k);if(!a)map.set(k,a=[]);a.push(v)};
+  for(const h of hist){
+    const n=normKey(h.desc);if(n.incoming)continue;
+    const v={cat:h.cat,sub:h.sub,rel:relShare(h.share,h.owner),share:h.share,owner:h.owner,memo:h.memo||"",amt:h.amt,m:h.m};
+    push(idx.key,n.key,v);push(idx.k2,n.k2,v);if(n.k1.length>=4)push(idx.k1,n.k1,v);
+  }
+  return idx;
+}
+function vote(list,owner){
+  const L={},S={},M={};let W=0;
+  for(const v of list){
+    const w=v.owner===owner?2:1;W+=w;
+    const lk=v.cat+"|"+v.sub;L[lk]=(L[lk]||0)+w;
+    const sk=absShare(v.rel,owner);S[sk]=(S[sk]||0)+w;
+    if(v.memo){const mk=lk+"§"+v.memo;M[mk]=(M[mk]||0)+w}
+  }
+  const top=o=>Object.entries(o).sort((a,b)=>b[1]-a[1])[0];
+  const [lk,lw]=top(L),[sk,sw]=top(S);
+  const mm=Object.entries(M).filter(([k])=>k.startsWith(lk+"§")).sort((a,b)=>b[1]-a[1])[0];
+  const [cat,sub]=lk.split("|");
+  return {cat,sub,share:sk,memo:mm&&mm[1]*2>=lw?mm[0].split("§")[1]:"",n:list.length,agreeL:lw/W,agreeS:sw/W}; /* a memo carries over only when most past rows with this label had it */
+}
+const RULES=[
+  {re:/^BILL DBSC|CARD ?PAYMENT|PAYMENT.{0,4}THANK|PAYMENT RECEIVED|AUTO-?PAY|카드\s?대금|결제대금|BALANCE TRANSFER|^PAYMENT\b/i,p:{cat:"ETC",sub:"Etc",share:"Excluded"},conf:"high",why:"Card bill payment. The spending is already on the card statement."},
+  {re:/WISE ASIA-PACIFIC|INTERACTIVE BR|I-BANK TRANSFER|SYFE|ENDOWUS|MOOMOO|TIGER BROKERS|STASHAWAY/i,p:{cat:"ETC",sub:"Etc",share:"Excluded"},conf:"mid",why:"Looks like a transfer or investment, not spending."},
+];
+function predict(row,idx){
+  const n=normKey(row.desc),owner=row.owner;
+  for(const r of RULES)if(r.conf==="high"&&r.re.test(row.desc))return {...r.p,memo:"",conf:"high",src:"rule",why:r.why};
+  if(n.incoming&&row.amt!=null&&row.amt<0)return {cat:"EAT",sub:"Dine out",share:"Shared",memo:"",conf:"mid",src:"rule",why:"Money in from someone. Treated as their share of a meal, which lowers your spend."};
+  const ex=idx.key.get(n.key);
+  if(ex&&ex.length){
+    const v=vote(ex,owner);
+    const high=v.n>=2&&v.agreeL>=0.75&&v.agreeS>=0.75;
+    return {cat:v.cat,sub:v.sub,share:v.share,memo:v.memo,conf:high?"high":"mid",src:"history",
+      why:`Seen ${v.n}× before${v.n>1?`, ${Math.round(Math.min(v.agreeL,v.agreeS)*100)}% the same way`:""}.`};
+  }
+  for(const r of RULES)if(r.re.test(row.desc))return {...r.p,memo:"",conf:r.conf,src:"rule",why:r.why};
+  const near=(idx.k2.get(n.k2)||[]).length?idx.k2.get(n.k2):(n.k1.length>=4?idx.k1.get(n.k1):null);
+  if(near&&near.length){
+    const v=vote(near,owner);
+    return {cat:v.cat,sub:v.sub,share:v.share,memo:v.memo,conf:"mid",src:"similar",why:`Similar to “${n.k2||n.k1}” seen ${v.n}× before.`};
+  }
+  return null;
+}
+/* few-shot examples for Claude: nearest history rows by token overlap */
+function nearest(desc,idx,k){
+  const t=new Set(normKey(desc).toks);if(!t.size)return [];
+  const sc=[];
+  for(const h of idx.all){const ht=normKey(h.desc).toks;let o=0;for(const x of ht)if(t.has(x))o++;if(o)sc.push([o/(ht.length+t.size-o),h])}
+  return sc.sort((a,b)=>b[0]-a[0]).slice(0,k).map(x=>x[1]);
+}
+
+
+
+
+// ===== 시트 행 변환 (index.html 356-363) =====
+function cellDate(v){v=String(v??"").trim();if(/^\d{4}-\d{2}-\d{2}/.test(v))return v.slice(0,10);if(/^\d{5}$/.test(v)){return new Date(Date.UTC(1899,11,30)+(+v)*864e5).toISOString().slice(0,10)}return parseDate(v,new Date().getFullYear())}
+const TXT=v=>{v=v==null?"":String(v);return v&&(/^[=+\-@']/.test(v)||/^[\d.,\/\-: ]+$/.test(v))?"'"+v:v};
+const last4=desc=>{const m=String(desc||"").match(/X{4}-X{4}-X{4}-(\d{4})/);return m?m[1]:""};
+function rowFromSheet(r,i){
+  const g=j=>r[j]==null?"":String(r[j]);const amt=parseFloat(g(3)),o=g(5)===""?amt:parseFloat(g(5));
+  return {id:g(0),d:cellDate(g(1)),desc:g(2),amt:isFinite(amt)?amt:0,cur:g(4)||"SGD",orig:isFinite(o)?o:amt,acct:g(6),card:g(7),owner:g(8),share:g(9),cat:g(10),sub:g(11),memo:g(12),m:g(13).slice(0,7),source:g(14),posted:g(15),status:g(16),mcc:g(17),channel:g(18),xref:g(19),ref:{row:i+2}};
+}
+function rowToSheet(h){return [h.id,"'"+h.d,TXT(h.desc),Math.round(h.amt*100)/100,h.cur,h.orig,h.acct,h.card?"'"+h.card:"",h.owner,h.share,h.cat,h.sub,TXT(h.memo||""),"'"+h.m,h.source||"statement",h.posted?"'"+h.posted:"",h.status||"final",h.mcc?"'"+h.mcc:"",h.channel||"",h.xref||""]}
+
+
+// ===== 명세서 파싱 (index.html 506-585) =====
+/* ===== parsing ===== */
+const MON="jan feb mar apr may jun jul aug sep oct nov dec".split(" ");
+function iso(y,m,d){y=+y;if(y<100)y+=2000;m=+m;d=+d;if(!(m>=1&&m<=12&&d>=1&&d<=31))return null;return `${y}-${pad(m)}-${pad(d)}`}
+function parseDate(v,yr){
+  if(v instanceof Date&&!isNaN(v))return iso(v.getFullYear(),v.getMonth()+1,v.getDate());
+  if(typeof v==="number"&&v>20000&&v<80000){const p=XLSX.SSF.parse_date_code(v);return iso(p.y,p.m,p.d)}
+  let s=String(v??"").trim().replace(/,/g," ");let m;if(!s)return null;
+  if(m=s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/))return iso(m[1],m[2],m[3]);
+  if(m=s.match(/^(\d{2})\.(\d{1,2})\.(\d{1,2})$/))return iso(m[1],m[2],m[3]);
+  if(m=s.match(/^(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?$/))return iso(m[3]||yr,m[2],m[1]);
+  if(m=s.match(/^(\d{1,2})[\s\-]*([A-Za-z]{3})[a-z]*(?:[\s\-]+(\d{2,4}))?$/)){const i=MON.indexOf(m[2].toLowerCase());return i<0?null:iso(m[3]||yr,i+1,m[1])}
+  if(m=s.match(/^([A-Za-z]{3})[a-z]*\s+(\d{1,2})(?:\s+(\d{4}))?$/)){const i=MON.indexOf(m[1].toLowerCase());return i<0?null:iso(m[3]||yr,i+1,m[2])}
+  return null}
+function num(v){if(typeof v==="number")return v;let s=String(v??"").trim();if(!s)return NaN;const neg=/^\(.*\)$/.test(s)||/^-|−/.test(s)||/\bDR\b/i.test(s);const cr=/\bCR\b/i.test(s);s=s.replace(/[^0-9.]/g,"");if(!s)return NaN;const n=parseFloat(s);return neg&&!cr?-n:n}
+
+async function readTable(file,acct){
+  const wb=XLSX.read(await file.arrayBuffer(),{type:"array",cellDates:true});const yr=+ST.month.slice(0,4);let out=[];
+  for(const name of wb.SheetNames){
+    const rows=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,raw:true,defval:""});
+    let h=-1,c={};
+    for(let i=0;i<Math.min(rows.length,40);i++){
+      const r=rows[i].map(x=>String(x).toLowerCase().trim());
+      const d=r.findIndex(x=>/date/.test(x)||x==="거래일"||x==="이용일"||x==="거래일시"||x==="이용일자");
+      const t=r.map((x,j)=>/desc|detail|particular|narrat|merchant|payee|remark|reference|ref|transaction(?! date)|가맹점|적요|내용|이용처/.test(x)&&j!==d?j:-1).filter(j=>j>=0);
+      if(d>=0&&t.length){h=i;c={d,t,db:r.findIndex(x=>/debit|withdraw|outflow|paid out|spent|출금|지출/.test(x)),cr:r.findIndex(x=>/credit|deposit|inflow|paid in|입금/.test(x)),am:r.findIndex(x=>/amount|amt|금액/.test(x)&&!/bal|잔액/.test(x)),cu:r.findIndex(x=>/^currency|^ccy|통화/.test(x)),fl:r.findIndex(x=>/^(flag|status|state|상태|비고)$/.test(x))};break}
+    }
+    if(h<0)continue;
+    const raw=[];
+    for(let i=h+1;i<rows.length;i++){const r=rows[i];const date=parseDate(r[c.d],yr);if(!date)continue;
+      const desc=c.t.map(j=>String(r[j]).trim()).filter(Boolean).join(" ").replace(/\s+/g," ");
+      if(!desc||/opening balance|closing balance|balance b\/f|balance c\/f|total/i.test(desc))continue;
+      if(c.fl>=0&&/cancel|void|revers|declin|취소/i.test(String(r[c.fl])))continue; /* a cancelled charge is not spending */
+      let v,two=false;
+      if(c.db>=0||c.cr>=0){const a=c.db>=0?num(r[c.db]):NaN,b=c.cr>=0?num(r[c.cr]):NaN;if(isFinite(a)&&a||isFinite(b)&&b){v=(isFinite(a)?Math.abs(a):0)-(isFinite(b)?Math.abs(b):0);two=true}}
+      if(v===undefined&&c.am>=0)v=num(r[c.am]);
+      if(!isFinite(v)||v===0)continue;
+      raw.push({d:date,desc,v,two,cur:c.cu>=0&&/^[A-Z]{3}$/.test(String(r[c.cu]).trim())?String(r[c.cu]).trim():acct.currency});
+    }
+    const singles=raw.filter(x=>!x.two),negShare=singles.length?singles.filter(x=>x.v<0).length/singles.length:0;
+    const flip=acct.sign==="spend-"||(acct.sign!=="spend+"&&negShare>0.6);
+    out=out.concat(raw.map(x=>({d:x.d,desc:x.desc,orig:x.two?x.v:(flip?-x.v:x.v),cur:x.cur})));
+  }
+  return out;
+}
+async function pdfText(x){
+  if(!window.pdfjsLib)throw {msg:"The PDF reader didn't load. Reload the page and try again"};
+  const task=pdfjsLib.getDocument({data:new Uint8Array(await x.f.arrayBuffer())});
+  task.onPassword=(cb,reason)=>{x.st="password";x.err=reason===2?"wrong password":"";renderFiles();x.pwResolve=v=>{x.st="reading";renderFiles();cb(v)}};
+  const pdf=await task.promise;x.pdfDoc=pdf;const pages=[];
+  for(let p=1;p<=pdf.numPages;p++){const tc=await(await pdf.getPage(p)).getTextContent();const g={};
+    tc.items.forEach(it=>{if(!it.str.trim())return;const y=Math.round(it.transform[5]/3);(g[y]=g[y]||[]).push([it.transform[4],it.str])});
+    pages.push(Object.keys(g).sort((a,b)=>b-a).map(y=>g[y].sort((a,b)=>a[0]-b[0]).map(v=>v[1]).join(" ").replace(/\s+/g," ").trim()).join("\n"))}
+  return pages;
+}
+function extractPrompt(acct,src){
+  return `You are extracting transactions from a ${src} of a personal bank or card account (the user says it is "${acct.name}", default currency ${acct.currency}). The statement month is ${ST.month}.
+Return ONLY a JSON object: {"source":"the bank, card or app name visible in the document, or empty if none is shown","rows":[{"date":"YYYY-MM-DD","desc":"merchant or description exactly as printed","amount":12.34,"dir":"out"|"in","cur":"SGD"}]}.
+Rules:
+- amount is a positive number in the currency the account is charged in. For foreign spending on an SGD card use the SGD amount, not the foreign one. Korean statements are KRW.
+- dir "out" = purchases, fees, interest charged, transfers or payments sent; "in" = refunds, cashback, credits, money received, card payments received.
+- Skip opening/closing balances, running balance columns, subtotals, minimum payment lines, reward points, and anything that is not a single transaction.
+- If the year is not printed, use the year that puts the date in or just before ${ST.month}.
+- No prose, no markdown fences.`;
+}
+function fromLLM(res,acct,x){const arr=Array.isArray(res)?res:(res&&Array.isArray(res.rows)?res.rows:[]);if(x&&res&&res.source)checkSource(x,res.source);return arr.map(r=>{const d=parseDate(r.date,+ST.month.slice(0,4));const a=Math.abs(+r.amount);if(!d||!isFinite(a)||!a||!r.desc)return null;return {d,desc:String(r.desc).replace(/\s+/g," ").trim(),orig:r.dir==="in"?-a:a,cur:/^[A-Z]{3}$/.test(r.cur||"")?r.cur:acct.currency}}).filter(Boolean)}
+async function readPdf(x,acct){
+  const pages=await pdfText(x);
+  if(!ST.sample)throw {msg:"PDF reading needs Claude, which isn't available in this view"};
+  x.st="asking";renderFiles();
+  const chunks=[];let cur="";for(const p of pages){if(cur.length+p.length>40000&&cur){chunks.push(cur);cur=""}cur+=p+"\n\n"}if(cur.trim())chunks.push(cur);
+  let out=[];for(const ch of chunks){const r=await ST.sample.json(extractPrompt(acct,"PDF statement (text below)")+"\n\nSTATEMENT TEXT:\n"+ch,{modelTier:"default"});out=out.concat(fromLLM(r,acct,x))}
+  return out;
+}
+async function readImage(x,acct){
+  if(!ST.sample)throw {msg:"Screenshots need Claude, which isn't available in this view"};
+  const lim=await ST.sample.limits().catch(()=>null);if(!lim||!lim.images)throw {msg:"This view can't send images to Claude"};
+  x.st="asking";renderFiles();
+  const r=await ST.sample.json(extractPrompt(acct,"screenshot of a banking or card app (attached image)"),{images:[x.f],modelTier:"default"});
+  return fromLLM(r,acct,x);
+}
+
+
+
+// ===== 수수료 연결·FX·중복 (index.html 613-683) =====
+const FEE_RE=/(MARK ?-?UP|FOREX|\bFX (FEE|CHARGE|MARKUP)|CROSS[- ]?(CURRENCY|BORDER)|CCY CONVERSION|CURRENCY CONVERSION|CONVERSION FEE|FOREIGN (CURRENCY |TRANSACTION |TXN )?(FEE|CHARGE|MARKUP)|\bDCC\b|\bIGST\b|\bCGST\b|\bSGST\b|\bGST ON\b|SERVICE TAX ON)/i;
+function linkFees(list){
+  const dd=(a,b)=>Math.abs(new Date(a)-new Date(b))/864e5;
+  for(const f of list){
+    if(!f.fee||f.st!=="pending")continue;
+    const pool=ST.pend.filter(c=>!c.fee&&c.fileKey===f.fileKey&&dd(c.d,f.d)<=3);
+    let par=null;const m=String(f.desc).match(/ON\s*\(?\s*(?:[A-Z]{3}\s*)?([\d,]+\.\d{2})/i);
+    if(m){const v=parseFloat(m[1].replace(/,/g,""));par=pool.find(c=>Math.abs(Math.abs(c.orig)-v)<0.011||Math.abs(Math.abs(c.amt??0)-v)<0.011)||null}
+    if(!par){const i=ST.pend.indexOf(f);const before=pool.filter(c=>ST.pend.indexOf(c)<i).sort((a,b)=>ST.pend.indexOf(b)-ST.pend.indexOf(a));par=before[0]||pool.sort((a,b)=>dd(a.d,f.d)-dd(b.d,f.d))[0]||null}
+    if(par&&par.lab){
+      f.parent=par.id;f.lab={cat:par.lab.cat,sub:par.lab.sub,share:par.lab.share,memo:par.lab.memo};
+      f.pred={...f.lab,conf:par.pred&&par.pred.conf==="high"?"high":"mid",src:"fee",why:`Fee on ${titleCase(normKey(par.desc).key||par.desc)} ${par.d.slice(5)}. Follows that row.`};
+    }else if(!par){
+      const g=predict(f,ST.idx);f.pred=g&&g.share!=="Excluded"?{...g,conf:"low",why:"Fee, no matching purchase found. Please check."}:{cat:"ETC",sub:"Etc",share:"Personal - "+(f.owner==="Joint"?"Sejeong":f.owner),memo:"",conf:"low",src:"fee",why:"Fee, no matching purchase found. Please check."};
+      f.lab={cat:f.pred.cat,sub:f.pred.sub,share:f.pred.share,memo:f.pred.memo};
+    }
+  }
+}
+function mkPending(r,acct,file){
+  const p={id:++ST.uid,d:r.d,desc:r.desc,orig:r.orig,cur:r.cur||acct.currency,acct:acct.name,owner:acct.owner,file,m:ST.month,st:"pending",edit:false,dup:""};
+  p.amt=toSgd(p);if(FEE_RE.test(r.desc)){p.fee=true;p.pred=null;return p}p.pred=predict(p,ST.idx);
+  if(p.pred)p.lab={cat:p.pred.cat,sub:p.pred.sub,share:p.pred.share,memo:p.pred.memo};
+  return p;
+}
+function monthEnd(m){const [y,mo]=m.split("-").map(Number);const d=new Date(y,mo,0);return d.toLocaleDateString("en-SG",{day:"numeric",month:"short",year:"numeric"})}
+function rate(m,cur){if(cur==="SGD")return 1;const r=(ST.cfg.fx[m]||{})[cur];return r?+r:null}
+function toSgd(p){const r=rate(p.m,p.cur);return r==null?null:Math.round(p.orig*r*100)/100}
+function dk(o){return [o.d,Math.round(Math.abs(o.orig??o.amt)*100),normKey(o.desc).key,o.acct].join("|")}
+function markDups(fresh){
+  const saved=new Map();ST.hist.forEach(h=>{if(h.status!=="provisional")saved.set(dk(h),h.m)});
+  const seen=new Set(ST.pend.map(dk));
+  const taken=new Set(ST.pend.map(p=>p.confirms).filter(Boolean));
+  const prov=ST.hist.filter(h=>h.status==="provisional");
+  const dd=(a,b)=>Math.abs(new Date(a)-new Date(b))/864e5;
+  for(const p of fresh){const k=dk(p);if(saved.has(k)){p.dup=`Already saved in ${saved.get(k)}`;seen.add(k);continue}
+    if(seen.has(k)){p.dup="Same date, amount and merchant as another row here";continue}seen.add(k);
+    /* a statement row that matches an email-alert row confirms it instead of adding a second copy */
+    const v=p.amt??p.orig;const h=prov.find(h=>!taken.has(h)&&h.acct===p.acct&&Math.abs(h.amt-v)<0.011&&dd(h.d,p.d)<=4);
+    if(h){taken.add(h);p.confirms=h;p.pred={cat:h.cat,sub:h.sub,share:h.share,memo:h.memo,conf:"high",src:"alert",why:`Confirms the email alert of ${h.d.slice(5)}. Saving replaces that row.`};p.lab={cat:h.cat,sub:h.sub,share:h.share,memo:h.memo}}}
+}
+async function askClaude(list){
+  if(!list.length)return;
+  if(!ST.sample){list.forEach(p=>{p.pred={cat:"ETC",sub:"Etc",share:"Shared",memo:"",conf:"low",src:"none",why:"New merchant. Claude isn't available here, so please pick a category."};p.lab={...p.pred}});renderReview();return}
+  setAsk(`Claude is classifying ${list.length} new merchant${list.length>1?"s":""}…`);
+  const shots=new Map();
+  for(let i=0;i<list.length;i+=30){
+    const batch=list.slice(i,i+30);const ex=new Set();
+    batch.forEach(p=>nearest(p.desc,ST.idx,4).forEach(h=>ex.add(h)));
+    const exl=[...ex].slice(0,90).map(h=>`${h.desc.slice(0,70)} | ${h.amt} | paid by ${h.owner} | ${h.cat}/${h.sub} | ${h.share}${h.memo?" | "+h.memo.slice(0,40):""}`).join("\n");
+    const prompt=`Classify household transactions for Ankit and Sejeong, a couple in Singapore (Sejeong also has Korean accounts). Learn their habits from the examples, then label each new row.
+Categories (category: sub-categories): ${JSON.stringify(TAX)}
+Share is one of: "Shared" (household spending for both), "Personal - Ankit", "Personal - Sejeong", "Excluded" (not spending: transfers between their own accounts, card bill payments, investments, savings, loan interest bookkeeping).
+Amounts are SGD; positive = money out, negative = money in (a refund or someone paying them back).
+Past examples (description | SGD | paid by | category/sub | share | memo):
+${exl}
+
+New rows (id | description | SGD | paid by):
+${batch.map(p=>`${p.id} | ${p.desc.slice(0,90)} | ${p.amt??p.orig+" "+p.cur} | ${p.owner}`).join("\n")}
+
+Reply with ONLY a JSON array of objects {"id":number,"cat":string,"sub":string,"share":string,"memo":string,"conf":number between 0 and 1,"why":string under 12 words}. memo is a 2-5 word plain note like the examples, or "".`;
+    try{
+      const r=await ST.sample.json(prompt,{modelTier:"default"});
+      (Array.isArray(r)?r:[]).forEach(o=>{const p=batch.find(b=>b.id===+o.id);if(!p||!TAX[o.cat]||!TAX[o.cat].includes(o.sub)||!SHARES.includes(o.share))return;
+        p.pred={cat:o.cat,sub:o.sub,share:o.share,memo:String(o.memo||""),conf:(+o.conf>=0.85?"mid":"low"),src:"claude",why:"New merchant. Claude: "+String(o.why||"").slice(0,90)};p.lab={cat:o.cat,sub:o.sub,share:o.share,memo:p.pred.memo}});
+    }catch(e){console.error(e);setAsk(e&&e.code==="not_granted"?"Claude access was declined, so new merchants need a category picked by hand.":e&&e.code==="rate_limited"?"Claude is busy right now. Remaining new merchants need a category picked by hand.":"Claude stopped early. Remaining new merchants need a category picked by hand.");break}
+    renderReview();
+  }
+  list.filter(p=>!p.pred).forEach(p=>{p.pred={cat:"ETC",sub:"Etc",share:"Shared",memo:"",conf:"low",src:"none",why:"New merchant. Please pick a category."};p.lab={...p.pred}});
+  if(!ST.askKeep)setAsk("");
+  renderReview();
+}
+
+
+// ===== monthRows·stats·settle (index.html 786-809) =====
+function monthRows(m){return ST.hist.filter(h=>h.m===m)}
+function renderProv(m){
+  const el=$("m-prov");const P=monthRows(m).filter(h=>h.status==="provisional");
+  if(!P.length){el.innerHTML="";return}
+  const pre=P.filter(h=>/BUS\/MRT/i.test(h.desc)&&Math.abs(h.amt-0.1)<0.001);
+  el.innerHTML=`<div class="notice">${P.length} rows this month come from email alerts (S$${money(P.reduce((s,h)=>s+h.amt,0))}) and are not yet confirmed by a statement. Uploading the statement on the Review tab confirms them.${pre.length&&ST.mode==="sheet"?` ${pre.length} of them are S$0.10 bus/MRT pre-authorisations; the real fares come with the statement. <button class="btn sm" id="pv-del" type="button">Remove the ${pre.length} pre-authorisation rows</button>`:""}</div>`;
+  const b=$("pv-del");if(b)b.onclick=async()=>{b.disabled=true;try{for(const h of pre)await sh("update_values",{range:`transactions!Q${h.ref.row}`,values:[["deleted"]]});await reloadSheet()}catch(e){console.error(e);b.textContent="Couldn't remove"}};
+}
+function stats(R){
+  const sp=R.filter(h=>h.share!=="Excluded");const sum=a=>a.reduce((s,h)=>s+h.amt,0);
+  const shared=sp.filter(h=>h.share==="Shared");
+  const rent=sum(sp.filter(h=>h.sub==="Rent")),travel=sum(sp.filter(h=>h.sub==="Travel")),tax=sum(sp.filter(h=>h.sub==="Tax"));
+  const total=sum(sp);
+  return {total,shared:sum(shared),pa:sum(sp.filter(h=>h.share==="Personal - Ankit")),ps:sum(sp.filter(h=>h.share==="Personal - Sejeong")),rent,travel,tax,everyday:total-rent-travel-tax,sp,sharedRows:shared};
+}
+/* Same method as the monthly Summary sheet: everything not Excluded, minus what the joint account paid, is split by ratio; compare with what each person's accounts paid. */
+function settle(R){
+  const s=stats(R),rA=ST.cfg.ratio.Ankit??0.6,rS=1-rA;
+  const paid={Ankit:0,Sejeong:0,Joint:0};s.sp.forEach(h=>paid[h.owner in paid?h.owner:"Joint"]+=h.amt);
+  const base=s.total-paid.Joint;
+  const contA=rA*base,contS=rS*base;
+  const balA=contA-paid.Ankit; /* >0: Ankit sends to Sejeong */
+  return {paid,base,rA,rS,contA,contS,balA};
+}
+
+
+// ===== 월급 목표 헬퍼 (index.html 911-916) =====
+const DISC=new Set(["Dine out","Drink/Party","Work Lunch","Taxi","Shopping","Beauty","Hobbies","Subscription","Necessities"]);
+function monthInfo(m){const R=monthRows(m),s=stats(R),st=settle(R);return {m,R,s,exT:s.total-s.travel,complete:st.paid.Ankit>0&&st.paid.Sejeong>0}}
+function subTotals(R){const o={};R.forEach(h=>{if(h.share==="Excluded"||h.sub==="Travel")return;const k=h.cat+" › "+h.sub;o[k]=(o[k]||0)+h.amt});return o}
+function catTotals(R){const o={};R.forEach(h=>{if(h.share==="Excluded"||h.sub==="Travel")return;o[h.cat]=(o[h.cat]||0)+h.amt});return o}
+const pct=(a,b)=>b?Math.round((a-b)/Math.abs(b)*100):null;
+const sgn=v=>(v>0?"+":v<0?"−":"")+"S$"+money(Math.abs(v),0);
+
+
+</script>

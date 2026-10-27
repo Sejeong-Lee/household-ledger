@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Household Ledger</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{--bg:#f5f6f2;--ink:#1b211d;--mute:#5c635d;--mute2:#4f564f;--line:#d9ddd5;--line2:#c8cec3;--green:#2d6a52;--greenbg:#e3eee8;--amber:#b7791f;--amberbg:#f6ecdc;--red:#c2410c;--card:#fff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:'IBM Plex Sans',system-ui,sans-serif;font-size:14px;-webkit-text-size-adjust:100%}
+.mono{font-family:'IBM Plex Mono',monospace}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#app{max-width:520px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column}
+.top{padding:18px 16px 10px;background:var(--card);border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:10px;position:sticky;top:0;z-index:5}
+.row{display:flex;align-items:center;gap:8px}
+.brand{font-size:18px;font-weight:600}
+.pill{font-size:12px;border:1px solid var(--line2);border-radius:999px;padding:3px 10px;color:var(--mute2);background:#fff}
+.pill.on{border-color:var(--green);color:var(--green);background:var(--greenbg)}
+.ml{margin-left:auto}
+nav{display:flex;gap:4px}
+nav button{flex:1;border:0;background:none;padding:8px 0;border-radius:8px;font-size:13px;color:var(--mute2)}
+nav button.on{background:var(--ink);color:#fff;font-weight:500}
+main{flex:1;padding:14px 16px 100px;display:flex;flex-direction:column;gap:12px}
+section{display:flex;flex-direction:column;gap:12px}
+section[hidden]{display:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.card h3{margin:0;font-size:13px;font-weight:600}
+.sub{font-size:12px;color:var(--mute)}
+.pills{display:flex;flex-wrap:wrap;gap:6px}
+.drop{border:1.5px dashed #b8beb4;border-radius:12px;padding:22px 16px;display:flex;flex-direction:column;align-items:center;gap:4px;background:#fff;cursor:pointer}
+.drop input{display:none}
+.drop b{font-size:14px;font-weight:500}
+.file{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+.file.warn{border-color:#d9b98a}
+.ext{font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--mute2);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.fname{font-size:13px;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fst{font-size:12px;white-space:nowrap}
+.note{font-size:11.5px;color:var(--mute)}
+.note.amber{color:#8a5a14}
+.note.red{color:var(--red)}
+.sel,.inp{font-size:13px;padding:7px 8px;border:1px solid var(--line2);border-radius:8px;background:#fff;min-width:0}
+.btn{border:0;background:var(--green);color:#fff;font-size:14px;font-weight:500;padding:12px 16px;border-radius:9px}
+.btn.ghost{background:#fff;color:var(--ink);border:1px solid var(--line2);font-weight:400}
+.btn.sm{font-size:13px;padding:8px 12px}
+.link{background:none;border:0;color:var(--green);font-size:12.5px;padding:6px 0}
+.banner{margin:10px 16px 0;padding:10px 12px;background:#fbeee6;border:1px solid #e6b79a;color:#7a2e0b;border-radius:10px;font-size:13px;display:flex;gap:8px;align-items:flex-start}
+.banner[hidden]{display:none}
+.foot{position:fixed;left:0;right:0;bottom:0;background:#fff;border-top:1px solid var(--line);padding:12px 16px 16px}
+.foot[hidden]{display:none}
+.foot>div{max-width:520px;margin:0 auto;display:flex;align-items:center;gap:10px}
+.footl{font-size:12px;color:var(--mute);line-height:1.4}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:12.5px;padding:6px 12px;border-radius:999px;border:1px solid var(--line2);background:#fff;color:var(--mute2)}
+.chip.on{background:var(--ink);border-color:var(--ink);color:#fff}
+.bulk{background:var(--greenbg);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:10px;font-size:12.5px;color:#1f4d3b}
+.hd{display:flex;align-items:baseline;border-bottom:1px solid var(--ink);padding-bottom:5px;font-size:14px;font-weight:600}
+.hd span{margin-left:8px;font-size:12px;color:var(--mute);font-weight:400}
+.tx{padding:10px 0;border-bottom:1px solid #e2e5de;display:flex;flex-direction:column;gap:6px}
+.tx.ok{background:#eef4f0}
+.tx.rej{opacity:.5}
+.txr{display:flex;gap:10px;align-items:flex-start}
+.txd{font-size:11.5px;color:var(--mute);width:40px;flex:none;padding-top:2px}
+.txm{flex:1;min-width:0}
+.txm b{display:block;font-size:13.5px;font-weight:500;overflow-wrap:anywhere}
+.txa{font-size:13.5px;white-space:nowrap}
+.txc{display:flex;flex-wrap:wrap;gap:6px;padding-left:50px}
+.tag{font-size:11.5px;border:1px solid var(--line2);border-radius:999px;padding:1px 9px}
+.tag.g{border-color:var(--green);color:var(--green)}
+.txw{display:flex;align-items:center;gap:8px;padding-left:50px}
+.dot{width:8px;height:8px;border-radius:50%;flex:none}
+.why{font-size:11.5px;color:var(--mute);flex:1;min-width:0}
+.ib{width:36px;height:36px;border-radius:8px;border:1px solid var(--line2);background:#fff;color:var(--mute2);font-size:15px;padding:0}
+.ib.on{background:var(--green);border-color:var(--green);color:#fff}
+.edit{margin-left:50px;display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px 0 2px}
+.edit label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--mute)}
+.edit .wide{grid-column:1/-1}
+.edit .chk{flex-direction:row;align-items:center;gap:8px;font-size:12.5px;color:var(--ink)}
+.edit .chk input{width:18px;height:18px}
+.total{background:var(--ink);color:#fff;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.total .big{font-size:30px;font-weight:500}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+.bar{width:100%;text-align:left;background:#fff;border:1px solid #e2e5de;border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:5px}
+.bar.on{background:#eef4f0;border-color:var(--green)}
+.seg{display:flex;height:8px;border-radius:3px;overflow:hidden}
+.seg i{display:block;height:8px}
+.tgl{display:flex;border:1px solid var(--line2);border-radius:8px;overflow:hidden}
+.tgl button{border:0;background:#fff;padding:7px 12px;font-size:12.5px;color:var(--mute2)}
+.tgl button.on{background:var(--ink);color:#fff}
+.meter{height:10px;border-radius:5px;background:#e2e5de;overflow:hidden}
+.meter i{display:block;height:10px;background:var(--green)}
+.li{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eef0eb;font-size:13px}
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <div class="row"><div class="brand">Household Ledger</div><div id="who" class="pill ml">…</div></div>
+    <nav id="tabs"></nav>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <main>
+    <section id="v-upload">
+      <div id="up-check" class="card"></div>
+      <label class="drop">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#2d6a52" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+        <b>Add statements</b>
+        <span class="sub">CSV · Excel · PDF · screenshots</span>
+        <input id="fileIn" type="file" multiple accept=".csv,.tsv,.xlsx,.xls,.pdf,image/*">
+      </label>
+      <div id="up-files" style="display:flex;flex-direction:column;gap:8px"></div>
+    </section>
+    <section id="v-review" hidden>
+      <div id="rv-top" style="display:flex;flex-direction:column;gap:10px"></div>
+      <div id="rv-list"></div>
+      <div id="rv-conf"></div>
+    </section>
+    <section id="v-month" hidden></section>
+    <section id="v-settings" hidden></section>
+  </main>
+  <footer id="foot" class="foot" hidden></footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<?!= include('Engine') ?>
+<?!= include('App') ?>
+</body>
+</html>

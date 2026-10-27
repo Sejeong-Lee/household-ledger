@@ -1,0 +1,12 @@
+{
+  "name": "household-ledger-tests",
+  "private": true,
+  "scripts": {
+    "build": "python3 build.py",
+    "test": "python3 build.py && node gas.js && node t4.js && node t6.js && node t8.js"
+  },
+  "devDependencies": {
+    "pdfjs-dist": "3.11.174",
+    "xlsx": "0.18.5"
+  }
+}
